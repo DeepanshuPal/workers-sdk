@@ -3,13 +3,22 @@ import path from "node:path";
 import { installPackages } from "@cloudflare/cli-shared-helpers/packages";
 import {
 	BunPackageManager,
+	getInstalledPackageVersion,
 	NpmPackageManager,
 	NubPackageManager,
 	PnpmPackageManager,
 	YarnPackageManager,
 } from "@cloudflare/workers-utils";
 import { fileExists } from "../../files";
+import type { MigrationBundler } from "./types";
 import type { PackageManager } from "@cloudflare/workers-utils";
+
+const VITE_PLUGIN = "@cloudflare/vite-plugin";
+const VITE_PLUGIN_SPECIFIER = `${VITE_PLUGIN}@beta`;
+const VITE_PLUGIN_VERSION_PATTERN =
+	/^2\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const VITE_PLUGIN_RANGE_PATTERN =
+	/^(?:(?:\^|~)?2(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?|>=2\.0\.0-0 <3\.0\.0-0|beta)$/;
 
 const PACKAGE_MANAGERS = [
 	NubPackageManager,
@@ -30,7 +39,7 @@ interface PackageJson {
 	workspaces?: unknown;
 }
 
-type CfDependencyInstallPlan =
+type DependencyInstallPlan =
 	| {
 			action:
 				| "already-installed"
@@ -43,15 +52,17 @@ type CfDependencyInstallPlan =
 	  }
 	| {
 			action: "install";
+			devPackages: string[];
 			isWorkspaceRoot: boolean;
 			packageDirectory: string;
+			productionPackages: string[];
 	  };
 
-interface CfDependencyInstallOptions {
+interface DependencyInstallOptions {
 	dryRun: boolean;
 }
 
-interface CfDependencyInstallResult {
+interface DependencyInstallResult {
 	changedFiles: string[];
 	requiresInstall: boolean;
 }
@@ -76,6 +87,36 @@ function hasCfDependency(packageJson: PackageJson): boolean {
 		packageJson.dependencies?.cf !== undefined ||
 		packageJson.devDependencies?.cf !== undefined
 	);
+}
+
+function needsVitePluginUpgrade(
+	packageJson: PackageJson,
+	projectDirectory: string
+): boolean {
+	const declaredVersion =
+		packageJson.dependencies?.[VITE_PLUGIN] ??
+		packageJson.devDependencies?.[VITE_PLUGIN];
+	if (typeof declaredVersion !== "string") {
+		return true;
+	}
+
+	const installedVersion = getInstalledPackageVersion(
+		VITE_PLUGIN,
+		projectDirectory
+	);
+	const compatibleInstalledVersion =
+		installedVersion !== undefined &&
+		VITE_PLUGIN_VERSION_PATTERN.test(installedVersion);
+	if (
+		!VITE_PLUGIN_RANGE_PATTERN.test(declaredVersion) &&
+		!(
+			/^(?:workspace:|file:|link:|portal:)/.test(declaredVersion) &&
+			compatibleInstalledVersion
+		)
+	) {
+		return true;
+	}
+	return installedVersion !== undefined && !compatibleInstalledVersion;
 }
 
 /** Finds the nearest package manifest at or above the migration directory. */
@@ -287,15 +328,18 @@ function getChangedFiles(
 }
 
 /**
- * Plans cf dependency installation without modifying the project.
+ * Plans migration dependency installation without modifying the project.
  *
  * @param projectDirectory Directory containing the Wrangler configuration.
  *
+ * @param bundler Bundler selected for the migrated project.
+ *
  * @returns The dependency action required by the migrated project.
  */
-export async function planCfDependencyInstallation(
-	projectDirectory: string
-): Promise<CfDependencyInstallPlan> {
+export async function planDependencyInstallation(
+	projectDirectory: string,
+	bundler: MigrationBundler
+): Promise<DependencyInstallPlan> {
 	const packageJsonPath = await findPackageJson(projectDirectory);
 	if (!packageJsonPath) {
 		return { action: "missing-manifest" };
@@ -314,7 +358,19 @@ export async function planCfDependencyInstallation(
 			...(error instanceof Error ? { reason: error.message } : {}),
 		};
 	}
-	if (hasCfDependency(packageJson)) {
+	const devPackages = hasCfDependency(packageJson) ? [] : ["cf@latest"];
+	const productionPackages: string[] = [];
+	if (
+		bundler === "vite" &&
+		needsVitePluginUpgrade(packageJson, projectDirectory)
+	) {
+		if (packageJson.dependencies?.[VITE_PLUGIN] !== undefined) {
+			productionPackages.push(VITE_PLUGIN_SPECIFIER);
+		} else {
+			devPackages.push(VITE_PLUGIN_SPECIFIER);
+		}
+	}
+	if (devPackages.length === 0 && productionPackages.length === 0) {
 		return { action: "already-installed" };
 	}
 	const isWorkspaceRoot =
@@ -323,24 +379,27 @@ export async function planCfDependencyInstallation(
 
 	return {
 		action: "install",
+		devPackages,
 		isWorkspaceRoot,
 		packageDirectory,
+		productionPackages,
 	};
 }
 
 /**
- * Installs cf using a dependency installation plan.
+ * Installs migration dependencies using a dependency installation plan.
  *
  * @param plan Planned package manager invocation for the migrated project.
  * @param options Whether to report planned changes without installing.
  *
  * @returns Package files changed or expected to change during installation.
  */
-export async function installCfDependency(
-	plan: Extract<CfDependencyInstallPlan, { action: "install" }>,
-	options: CfDependencyInstallOptions
-): Promise<CfDependencyInstallResult> {
-	const { isWorkspaceRoot, packageDirectory } = plan;
+export async function installMigrationDependencies(
+	plan: Extract<DependencyInstallPlan, { action: "install" }>,
+	options: DependencyInstallOptions
+): Promise<DependencyInstallResult> {
+	const { devPackages, isWorkspaceRoot, packageDirectory, productionPackages } =
+		plan;
 	const {
 		directory: lockFileDirectory,
 		packageManager,
@@ -364,11 +423,19 @@ export async function installCfDependency(
 
 	const before = await readFiles(packageFilePaths);
 
-	await installPackages(packageManager.type, ["cf@latest"], {
-		cwd: packageDirectory,
-		dev: true,
-		isWorkspaceRoot,
-	});
+	if (devPackages.length > 0) {
+		await installPackages(packageManager.type, devPackages, {
+			cwd: packageDirectory,
+			dev: true,
+			isWorkspaceRoot,
+		});
+	}
+	if (productionPackages.length > 0) {
+		await installPackages(packageManager.type, productionPackages, {
+			cwd: packageDirectory,
+			isWorkspaceRoot,
+		});
+	}
 
 	return {
 		changedFiles: getChangedFiles(before, await readFiles(packageFilePaths)),

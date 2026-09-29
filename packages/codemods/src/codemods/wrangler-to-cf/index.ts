@@ -14,8 +14,8 @@ import {
 } from "./file-writer";
 import { createFollowUp } from "./follow-ups";
 import {
-	installCfDependency,
-	planCfDependencyInstallation,
+	installMigrationDependencies,
+	planDependencyInstallation,
 } from "./install-dependencies";
 import { assertCompatibleWranglerVersion } from "./wrangler-version";
 import type {
@@ -40,6 +40,10 @@ async function assertTargetsDoNotExist(filePaths: string[]): Promise<void> {
 	throw new Error(
 		`Cannot migrate because ${existingTarget} already exists. Inspect and finish the existing migration; it will not be overwritten. Automated agents should read its TODOs and ask the user about unresolved choices.`
 	);
+}
+
+function formatDependencies(packages: string[]): string {
+	return packages.map((packageName) => `\`${packageName}\``).join(" and ");
 }
 
 /**
@@ -87,12 +91,25 @@ export async function migrateWranglerToCf(
 		bundler,
 		secretFiles
 	);
-	const dependencyPlan = await planCfDependencyInstallation(projectDirectory);
+	const dependencyPlan = await planDependencyInstallation(
+		projectDirectory,
+		bundler
+	);
+	const requiredPackages =
+		dependencyPlan.action === "install"
+			? [...dependencyPlan.devPackages, ...dependencyPlan.productionPackages]
+			: [
+					"cf@latest",
+					...(bundler === "vite" ? ["@cloudflare/vite-plugin@beta"] : []),
+				];
+	const dependencyNames = formatDependencies(requiredPackages);
+	const dependencyKind =
+		requiredPackages.length === 1 ? "a dev dependency" : "dev dependencies";
 	if (dependencyPlan.action === "missing-manifest") {
 		convertedConfig.followUps.push(
 			createFollowUp(
 				"cf-install-missing-manifest",
-				"No package.json was found. Create or locate the package that owns this Worker, then install `cf@latest` as a dev dependency before using the generated configuration."
+				`No package.json was found. Create or locate the package that owns this Worker, then install ${dependencyNames} as ${dependencyKind} before using the generated configuration.`
 			)
 		);
 	}
@@ -100,7 +117,7 @@ export async function migrateWranglerToCf(
 		convertedConfig.followUps.push(
 			createFollowUp(
 				"cf-install-skipped",
-				"An ancestor package.json was found, but it was not modified because it may belong to another project. Install `cf@latest` as a dev dependency in the package that owns this Worker."
+				`An ancestor package.json was found, but it was not modified because it may belong to another project. Install ${dependencyNames} as ${dependencyKind} in the package that owns this Worker.`
 			)
 		);
 	}
@@ -111,7 +128,7 @@ export async function migrateWranglerToCf(
 		convertedConfig.followUps.push(
 			createFollowUp(
 				"cf-install-failed",
-				`The local package.json could not be read, so \`cf\` could not be installed automatically. Resolve the reported package.json error, then install \`cf@latest\` as a dev dependency before using the generated configuration.${reason}`
+				`The local package.json could not be read, so migration dependencies could not be installed automatically. Resolve the reported package.json error, then install ${dependencyNames} before using the generated configuration.${reason}`
 			)
 		);
 	}
@@ -123,7 +140,7 @@ export async function migrateWranglerToCf(
 		convertedConfig.followUps.push(
 			createFollowUp(
 				"cf-install-disabled",
-				"Automatic dependency installation was disabled. Install `cf@latest` as a dev dependency before using the generated configuration."
+				`Automatic dependency installation was disabled. Install ${dependencyNames} before using the generated configuration.`
 			)
 		);
 	}
@@ -154,7 +171,7 @@ export async function migrateWranglerToCf(
 	if (installDependencies && dependencyPlan.action === "install") {
 		let dependencyFollowUp: MigrationFollowUp | undefined;
 		try {
-			const installResult = await installCfDependency(dependencyPlan, {
+			const installResult = await installMigrationDependencies(dependencyPlan, {
 				dryRun,
 			});
 			changedFiles.push(...installResult.changedFiles);
@@ -167,7 +184,7 @@ export async function migrateWranglerToCf(
 				error instanceof Error ? ` Installation failed: ${error.message}` : "";
 			dependencyFollowUp = createFollowUp(
 				"cf-install-failed",
-				`The generated configuration was written, but \`cf\` could not be installed automatically. Install \`cf@latest\` as a dev dependency with your package manager before using it.${reason}`
+				`The generated configuration was written, but migration dependencies could not be installed automatically. Install ${dependencyNames} with your package manager before using it.${reason}`
 			);
 			requiresInstall = true;
 		}
